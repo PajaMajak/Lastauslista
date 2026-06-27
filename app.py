@@ -1,0 +1,404 @@
+import streamlit as st
+import openpyxl
+from openpyxl.styles import Font, Alignment, Border, Side, PatternFill
+from openpyxl.utils import get_column_letter
+from pypdf import PdfReader
+import re
+import traceback
+import io
+
+def pura_pdf_tiedot(pdf_file):
+    tiedot = {
+        "trailer": "Ei ilmoitettu",
+        "tour": "Ei ilmoitettu",
+        "rivit": []
+    }
+    
+    # Huom: Nyt luetaan suoraan web-käyttöliittymän muistiin ladatusta tiedostosta
+    reader = PdfReader(pdf_file)
+    koko_teksti = ""
+    for sivu in reader.pages:
+        koko_teksti += sivu.extract_text() + "\n"
+        
+    if not koko_teksti.strip():
+        raise ValueError("PDF:stä ei saatu luettua yhtään tekstiä.")
+
+    # 1. Ylätunnisteen tiedot
+    tour_match = re.search(r"Loading order(?:[\s\|Ladeauftrag]*)?(\d+/\d+)", koko_teksti, re.IGNORECASE)
+    if tour_match: 
+        tiedot["tour"] = tour_match.group(1)
+    
+    trailer_match = re.search(r"(FL IMPORT[_\s]\d+|[A-Z]{2,3}-\d{3})", koko_teksti)
+    if trailer_match: 
+        tiedot["trailer"] = trailer_match.group(1)
+
+    # 2. KERÄTÄÄN KAIKKI PURKUPAIKAT ASIAKIRJAN LOPUSTA MUISTIIN
+    purkupaikat = []
+    unloading_lohkot = re.split(r'(?i)Unloading(?:\s*point)?(?:\s*\|\s*Entladestelle)?', koko_teksti)[1:]
+    
+    for u_lohko in unloading_lohkot:
+        lines = u_lohko.split('\n')
+        u_rivit = [r.strip() for r in lines if r.strip()]
+        if not u_rivit: continue
+        
+        if u_rivit[0].upper() in ['POINT', '| ENTLADESTELLE', 'POINT | ENTLADESTELLE']:
+            u_rivit = u_rivit[1:]
+            
+        if not u_rivit: continue
+        
+        if "THE FOLLOWING" in u_rivit[0].upper() or "RECEIVER NAME" in u_rivit[0].upper():
+            continue
+            
+        clean_rivit = []
+        for r in u_rivit:
+            ru = r.upper()
+            if "INSTRUCTION" in ru or "INSTRUKTION" in ru or "LOADING POINT" in ru or "LADESTELLE" in ru or "FREIGHT CHARGE" in ru or "REMARKS" in ru:
+                break
+                
+            if "CONTACT INFORMATION" in ru or "KONTAKTINFORMATIONEN" in ru or "PAGE " in ru or "SEITE " in ru or "LOADING ORDER" in ru or "LADEAUFTRAG" in ru:
+                continue
+                
+            if "DATE" in ru or "DATUM" in ru or "TIME" in ru or "UHRZEIT" in ru or "PACKAGE" in ru or "RECEIVER" in ru or "WEIGHT" in ru or "VOLUME" in ru or "Σ" in ru or "ENTLADESTELLE" in ru:
+                continue
+                
+            if re.match(r'^(FROM|TO|VON|BIS)', ru) or re.match(r'^\d{2}/\d{2}/\d{4}', ru) or re.match(r'^\d{2}:\d{2}', ru) or "REFERENCE NO." in ru or "REFERENZ" in ru or ru == "Σ" or "METRES (LDM)" in ru:
+                continue
+            
+            r_cleaned = re.sub(r'(?i)\b(to|bis)\s+\d+\b', '', r)
+            r_cleaned = r_cleaned.replace('"', '').replace(',', '').strip()
+            
+            if re.match(r'^\d{6,}$', r_cleaned.replace(' ', '')):
+                continue
+                
+            if r_cleaned and r_cleaned.upper() not in ["POINT", "| ENTLADESTELLE", "POINT | ENTLADESTELLE"]:
+                clean_rivit.append(r_cleaned)
+        
+        if clean_rivit:
+            nimi = clean_rivit[0]
+            if len(nimi) > 2:
+                purkupaikat.append({
+                    "name": nimi,
+                    "full_text": "\n".join(clean_rivit)
+                })
+                
+    purkupaikat.sort(key=lambda x: len(x["name"]), reverse=True)
+
+    # 3. Paloitellaan asiakkaat "Loading point"
+    lohkot = re.split(r'Loading point(?:\s*\|\s*Ladestelle)?', koko_teksti)
+    rivi_id = 1
+    
+    for lohko in lohkot:
+        end_summary_match = re.search(r'\n\s*(?:THE\s+FOLLOWING\s+UNLOADING|Unloading\s*(?:point|\|\s*Entladestelle)[^\n]*\n+(?!\s*(?:RECEIVER|EMP|PACKAGE|NAME\b)))', lohko, re.IGNORECASE)
+        if end_summary_match:
+            lohko = lohko[:end_summary_match.start()]
+            
+        consignor = ""
+        osoite = ""
+        date = ""
+        ref = ""
+        ldm = ""
+        
+        rivit = []
+        for r in lohko.split('\n'):
+            r = r.strip()
+            if not r: continue
+            ru = r.upper()
+            if "TRANSPORT MODE" in ru or "TRANSPORTMODUS" in ru or "PLEASE INFORM" in ru or "BITTE UMGEHEND" in ru: continue
+            if "VEHICLE REGISTR" in ru or "KFZ KENNZEICHEN" in ru or "DRIVER NAME" in ru or "NAME FAHRER" in ru: continue
+            if "FL IMPORT" in ru or "CUSTOMER NO" in ru or "KUNDEN NR" in ru: continue
+            if ru in ["LKW", "TRUCK", "HAULIER", "TRANSPORTUNTERNEHMER"]: continue
+            if re.match(r'^(LADESTELLE|ENTLADESTELLE)\s*\d*$', ru): continue
+            if re.match(r'^"?\d{3}"?$', ru): continue 
+            if re.match(r'^"?\d{2}/\d{4}"?$', ru): continue
+            if ru.startswith('"') and ("TRUCK" in ru or "HAULIER" in ru): continue
+            
+            rivit.append(r)
+            
+        if len(rivit) < 1: 
+            continue
+        
+        consignor = rivit[0]
+        
+        if "DACHSER FINLAND" in consignor.upper() or "DACHSER OY" in consignor.upper() or "DATE" in consignor.upper() or "DATUM" in consignor.upper() or "UNLOADING" in consignor.upper() or "ENTLADESTELLE" in consignor.upper() or "THE FOLLOWING" in consignor.upper():
+            continue
+            
+        osoite_rivit = []
+        stop_pattern = re.compile(r'\b(CONTACT INFORMATION|KONTAKTINFORMATIONEN|DATE|DATUM|REFERENCE|REFERENZ|INSTRUCTION|INSTRUCTIONS|INSTRUKTION|INSTRUKTIONEN|UNLOADING|ENTLADESTELLE|RECEIVER)\b', re.IGNORECASE)
+        
+        for r in rivit[1:]:
+            ru = r.upper()
+            match = stop_pattern.search(ru)
+            
+            if match:
+                idx = match.start()
+                if idx > 0:
+                    part = r[:idx].strip()
+                    if part.replace('"', ''):
+                        osoite_rivit.append(part.replace('"', ''))
+                break
+                
+            if re.match(r'^(FROM|VON)\b', ru):
+                break
+                
+            clean_r = r.replace('"', '').strip()
+            if clean_r:
+                osoite_rivit.append(clean_r)
+                
+        osoite = "\n".join(osoite_rivit)
+        
+        date_match = re.search(r"(\d{2})/(\d{2})/\d{4}", lohko)
+        if date_match:
+            kk = date_match.group(1)
+            pp = date_match.group(2)
+            date = f"{pp}.{kk}"
+        
+        alkuosa_teksti = re.split(r'(?i)Unloading', lohko, maxsplit=1)[0]
+        ref_str = ""
+        lines_alku = alkuosa_teksti.split('\n')
+        for i, l in enumerate(lines_alku):
+            if "REFERENCE NO" in l.upper() or "REFERENZ NR" in l.upper():
+                for j in range(i+1, min(i+4, len(lines_alku))):
+                    val = lines_alku[j].strip()
+                    vu = val.upper()
+                    if "INSTRUCTION" in vu or "INSTRUKTION" in vu or "UNLOADING" in vu or "DATE" in vu or "TIME" in vu: break
+                    if val:
+                        ref_str = val.replace('"', '')
+                        break
+                break
+                
+        refs = [x.strip() for x in ref_str.split(';')] if ref_str else []
+        
+        ldm_match = re.search(r"\(LDM\)[^\n\r\d]*[\n\r]*\s*([\d\.]+)", lohko)
+        if ldm_match:
+            ldm = ldm_match.group(1)
+        
+        try:
+            ldm_numero = float(ldm.replace(',', '.'))
+        except:
+            ldm_numero = ""
+
+        pt_lohko = lohko
+        m_start = re.search(r'(?i)(?:Package type|Receiver city|Receiver name|Empfänger)', lohko)
+        if m_start:
+            pt_lohko = lohko[m_start.start():]
+        else:
+            split_lines = lohko.split('\n')
+            if len(split_lines) > 5:
+                pt_lohko = '\n'.join(split_lines[4:])
+                
+        kaikki_pll_luvut = re.findall(r"(\d+)\s*/\s*(?:EU|FIN|EW|CL|EP|FP|PAL|PLL|[A-Z]{2})", pt_lohko, re.IGNORECASE)
+        
+        pll_numero_oletus = ""
+        if kaikki_pll_luvut:
+            pll_numero_oletus = int(kaikki_pll_luvut[0])
+            
+        if not ref_str and not kaikki_pll_luvut and not ldm:
+            continue
+        
+        consignees_data = []
+        
+        quoted = re.findall(r'"([^"]+)"', lohko)
+        for i, q in enumerate(quoted):
+            q_up = q.strip().upper()
+            
+            if q_up in ["RECEIVER NAME", "RECEIVER CITY", "PACKAGE TYPE", "WEIGHT", "LXWXH"]:
+                continue
+                
+            for p in purkupaikat:
+                p_up = p["name"].upper()
+                if p_up == q_up or p_up in q_up or q_up in p_up:
+                    if not any(c["full_text"] == p["full_text"] for c in consignees_data):
+                        consignees_data.append({
+                            "full_text": p["full_text"],
+                            "pll": pll_numero_oletus
+                        })
+
+        if not consignees_data:
+            m_list = re.findall(r'(?i)(?:Receiver name|Empfänger)[^\n\r]*[\n\r\s]+([^\n\r]+)', lohko)
+            for tm in m_list:
+                tm_clean = re.split(r'(?i)Unloading|Entladestelle|Date|Datum|Time|Uhrzeit|Contact|Kontakt', tm)[0].strip()
+                tm_clean = tm_clean.replace('"', '').replace(',', '').upper()
+                for p in purkupaikat:
+                    if p["name"].upper() in tm_clean or tm_clean in p["name"].upper():
+                        if not any(c["full_text"] == p["full_text"] for c in consignees_data):
+                            consignees_data.append({
+                                "full_text": p["full_text"],
+                                "pll": pll_numero_oletus
+                            })
+
+        if not consignees_data:
+            lohko_upper = lohko.upper()
+            for p in purkupaikat:
+                if p["name"].upper() in lohko_upper:
+                    if p["name"].upper() not in consignor.upper():
+                        if not any(c["full_text"] == p["full_text"] for c in consignees_data):
+                            consignees_data.append({
+                                "full_text": p["full_text"],
+                                "pll": pll_numero_oletus
+                            })
+                            
+        if not consignees_data:
+            consignees_data = [{"full_text": "", "pll": pll_numero_oletus}]
+            
+        lohko_rows_pll = []
+        for idx, c_info in enumerate(consignees_data):
+            if kaikki_pll_luvut and idx < len(kaikki_pll_luvut):
+                row_pll = int(kaikki_pll_luvut[idx])
+            else:
+                try:
+                    row_pll = int(c_info["pll"])
+                except:
+                    row_pll = 0
+            lohko_rows_pll.append(row_pll)
+            
+        summa_pll = sum(lohko_rows_pll)
+            
+        for idx, c_info in enumerate(consignees_data):
+            c_text = c_info["full_text"]
+            c_pll = lohko_rows_pll[idx]
+            
+            if isinstance(ldm_numero, (int, float)) and ldm_numero > 0:
+                if summa_pll > 0:
+                    row_ldm = round((c_pll / summa_pll) * ldm_numero, 2)
+                else:
+                    row_ldm = round(ldm_numero / len(consignees_data), 2)
+            else:
+                row_ldm = ldm_numero
+            
+            current_ref = refs[idx] if idx < len(refs) else (refs[-1] if refs else "")
+            
+            tiedot["rivit"].append([
+                rivi_id,
+                consignor,
+                osoite,
+                date,
+                "",
+                current_ref,
+                c_pll,
+                c_pll,
+                row_ldm,
+                "",
+                c_text,
+                ""
+            ])
+            rivi_id += 1
+        
+    return tiedot
+
+def luo_excel_muistiin(pdf_file):
+    pdf_tiedot = pura_pdf_tiedot(pdf_file)
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Lastauslista"
+
+    bold_font_14 = Font(bold=True, size=14)
+    normal_font_11 = Font(size=11)
+    title_font_16 = Font(bold=True, size=16)
+    bold_font_11 = Font(bold=True, size=11)
+    
+    center_align = Alignment(horizontal='center', vertical='center', wrap_text=True)
+    thin = Side(border_style="thin", color="000000")
+    border_all = Border(top=thin, left=thin, right=thin, bottom=thin)
+    orange_fill = PatternFill(start_color="F4B084", end_color="F4B084", fill_type="solid")
+
+    ws['A1'] = "DACHSER Finland Oy"
+    ws['A1'].font = title_font_16
+    
+    ws['B2'] = "Trailer:"
+    ws['B2'].font = bold_font_14
+    ws['C2'] = pdf_tiedot["trailer"]
+    ws['C2'].font = bold_font_14
+
+    ws['B3'] = "Tour:"
+    ws['B3'].font = bold_font_14
+    ws['C3'] = pdf_tiedot["tour"]
+    ws['C3'].font = bold_font_14
+
+    ws['B5'] = "Ferry:"
+    ws['B5'].font = bold_font_14
+    
+    ws['B6'] = "Closing:"
+    ws['B6'].font = bold_font_14
+
+    ws['F2'] = "Setpoint C1:"
+    ws['F2'].font = bold_font_14
+    
+    ws['F3'] = "Setpoint C2:"
+    ws['F3'].font = bold_font_14
+
+    headers = ["", "Consignor", "Loading address", "Loading date", "Time", "Loading ref.", "PLL", "PPL", "LDM", "Temp.", "Consignee", "Remarks"]
+    for col_num, header_text in enumerate(headers, 1):
+        cell = ws.cell(row=8, column=col_num)
+        cell.value = header_text
+        cell.font = bold_font_14
+        cell.alignment = center_align
+        cell.border = border_all
+
+    current_row = 9
+    for row_data in pdf_tiedot["rivit"]:
+        for col_num, cell_value in enumerate(row_data, 1):
+            cell = ws.cell(row=current_row, column=col_num)
+            cell.value = cell_value
+            cell.font = normal_font_11
+            cell.alignment = center_align
+            cell.border = border_all
+        current_row += 1
+
+    for c in [7, 8, 9]:
+        col_letter = get_column_letter(c)
+        cell = ws.cell(row=current_row, column=c)
+        cell.value = f"=SUM({col_letter}9:{col_letter}{current_row-1})"
+        cell.font = bold_font_11
+        cell.fill = orange_fill
+        cell.alignment = center_align
+        cell.border = border_all
+
+    ws.column_dimensions['A'].width = 5  
+    ws.column_dimensions['B'].width = 25 
+    ws.column_dimensions['C'].width = 30 
+    ws.column_dimensions['D'].width = 12 
+    ws.column_dimensions['E'].width = 10 
+    ws.column_dimensions['F'].width = 15 
+    ws.column_dimensions['G'].width = 8  
+    ws.column_dimensions['H'].width = 8  
+    ws.column_dimensions['I'].width = 8  
+    ws.column_dimensions['J'].width = 8  
+    ws.column_dimensions['K'].width = 30 
+    ws.column_dimensions['L'].width = 15 
+    
+    for r in range(9, current_row + 1):
+        ws.row_dimensions[r].height = 85
+
+    # Tallennetaan virtuaaliseen muistiin (BytesIO)
+    output = io.BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return output, pdf_tiedot["tour"].replace('/', '-')
+
+# --- STREAMLIT KÄYTTÖLIITTYMÄ ---
+st.set_page_config(page_title="Dachser Lastauslista", page_icon="🚚")
+
+st.title("🚚 Dachser PDF -> Excel Automaatio")
+st.write("Lataa Dachserin PDF-tiedosto tähän, niin ohjelma tekee siitä valmiin Excel-lastauslistan.")
+
+uploaded_file = st.file_uploader("Valitse PDF-tiedosto", type=["pdf"])
+
+if uploaded_file is not None:
+    with st.spinner("Luodaan Lastauslistaa..."):
+        try:
+            excel_data, tour_nro = luo_excel_muistiin(uploaded_file)
+            st.success("✅ Excel luotu onnistuneesti!")
+            
+            tiedostonimi = f"Lastauslista_{tour_nro}.xlsx" if tour_nro != "Ei ilmoitettu" else "Lastauslista.xlsx"
+            
+            st.download_button(
+                label="📥 Lataa Excel-tiedosto",
+                data=excel_data,
+                file_name=tiedostonimi,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+        except Exception as e:
+            st.error("Kriittinen virhe PDF:n luvussa. Varmista, että tiedosto on oikeassa muodossa.")
+            with st.expander("Näytä virheen tekniset tiedot"):
+                st.code(traceback.format_exc())
